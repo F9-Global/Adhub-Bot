@@ -1,11 +1,14 @@
 """
 Copyright © Krypton 2019-Present - https://github.com/kkrypt0nn (https://krypton.ninja)
 Description:
-🐍 A simple template to start to code your own and personalized Discord bot in Python
+A simple template to start to code your own and personalized Discord bot in Python
 
 Version: 6.5.0
 """
 
+import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -13,6 +16,7 @@ import platform
 import random
 import sys
 
+import aiohttp.web
 import aiosqlite
 import discord
 from discord.ext import commands, tasks
@@ -23,7 +27,7 @@ from database import DatabaseManager
 
 load_dotenv()
 
-"""	
+"""
 Setup bot intents (events restrictions)
 For more information about intents, please go to the following websites:
 https://discordpy.readthedocs.io/en/latest/intents.html
@@ -57,6 +61,7 @@ intents.presences = True
 """
 
 intents = discord.Intents.default()
+intents.members = True
 
 """
 Uncomment this if you want to use prefix (normal) commands.
@@ -118,6 +123,16 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 
+def verify_github_signature(payload_body: bytes, signature: str, secret: str) -> bool:
+    """Verify GitHub webhook HMAC-SHA256 signature."""
+    if not signature:
+        return False
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"), payload_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
 class DiscordBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(
@@ -137,6 +152,8 @@ class DiscordBot(commands.Bot):
         self.database = None
         self.bot_prefix = os.getenv("PREFIX")
         self.invite_link = os.getenv("INVITE_LINK")
+        self.webhook_app = None
+        self.webhook_runner = None
 
     async def init_db(self) -> None:
         async with aiosqlite.connect(
@@ -165,13 +182,55 @@ class DiscordBot(commands.Bot):
                         f"Failed to load extension {extension}\n{exception}"
                     )
 
+    async def start_webhook_server(self) -> None:
+        """Start the aiohttp web server for GitHub webhooks."""
+        self.webhook_app = aiohttp.web.Application()
+        self.webhook_app["bot"] = self
+
+        async def handle_github_webhook(request: aiohttp.web.Request):
+            secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+            body = await request.read()
+
+            # Verify signature if secret is configured
+            if secret:
+                signature = request.headers.get("X-Hub-Signature-256", "")
+                if not verify_github_signature(body, signature, secret):
+                    return aiohttp.web.Response(status=403, text="Invalid signature")
+
+            payload = json.loads(body)
+            event_type = request.headers.get("X-GitHub-Event", "ping")
+
+            # Dispatch to the github_feed cog
+            github_cog = self.get_cog("github_feed")
+            if github_cog:
+                asyncio.create_task(github_cog.process_event(event_type, payload))
+
+            return aiohttp.web.Response(status=200, text="OK")
+
+        async def handle_health(request: aiohttp.web.Request):
+            return aiohttp.web.json_response({"status": "ok", "bot": str(self.user)})
+
+        self.webhook_app.router.add_post("/webhook/github", handle_github_webhook)
+        self.webhook_app.router.add_get("/health", handle_health)
+
+        port = int(os.getenv("GITHUB_WEBHOOK_PORT", "8080"))
+        self.webhook_runner = aiohttp.web.AppRunner(self.webhook_app)
+        await self.webhook_runner.setup()
+        site = aiohttp.web.TCPSite(self.webhook_runner, "0.0.0.0", port)
+        await site.start()
+        self.logger.info(f"Webhook server listening on port {port}")
+
     @tasks.loop(minutes=1.0)
     async def status_task(self) -> None:
         """
         Setup the game status task of the bot.
         """
-        statuses = ["with you!", "with Krypton!", "with humans!"]
-        await self.change_presence(activity=discord.Game(random.choice(statuses)))
+        statuses = [
+            discord.Activity(type=discord.ActivityType.watching, name="AdHub repos"),
+            discord.Activity(type=discord.ActivityType.listening, name="GitHub webhooks"),
+            discord.Game("Monitoring dev branch"),
+        ]
+        await self.change_presence(activity=random.choice(statuses))
 
     @status_task.before_loop
     async def before_status_task(self) -> None:
@@ -199,6 +258,14 @@ class DiscordBot(commands.Bot):
                 f"{os.path.realpath(os.path.dirname(__file__))}/database/database.db"
             )
         )
+        # Start webhook server for GitHub events
+        await self.start_webhook_server()
+
+    async def close(self) -> None:
+        """Cleanup webhook server on shutdown."""
+        if self.webhook_runner:
+            await self.webhook_runner.cleanup()
+        await super().close()
 
     async def on_message(self, message: discord.Message) -> None:
         """
