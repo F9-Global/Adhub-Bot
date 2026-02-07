@@ -1,11 +1,12 @@
 """
 GitHub webhook feed cog for AdHub Bot.
-Receives GitHub events from the webhook server in bot.py and posts
-formatted embeds to a configured Discord channel.
+Receives GitHub events from the webhook server in bot.py and:
+  1. Posts individual event embeds to the feed channel (real-time)
+  2. Buffers events for the rebase reminder digest
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -31,6 +32,8 @@ COLORS = {
 class GitHubFeed(commands.Cog, name="github_feed"):
     def __init__(self, bot) -> None:
         self.bot = bot
+        # Event buffer for rebase digest - list of dicts
+        self.event_buffer = []
 
     def _get_channel(self):
         channel_id = os.getenv("GITHUB_FEED_CHANNEL_ID")
@@ -38,8 +41,91 @@ class GitHubFeed(commands.Cog, name="github_feed"):
             return None
         return self.bot.get_channel(int(channel_id))
 
+    def _buffer_event(self, event_type: str, payload: dict) -> None:
+        """Store a simplified event record for the rebase digest."""
+        now = datetime.now(timezone.utc)
+        repo = payload.get("repository", {}).get("full_name", "unknown")
+        sender = payload.get("sender", {}).get("login", "unknown")
+
+        record = {
+            "type": event_type,
+            "timestamp": now,
+            "repo": repo,
+            "sender": sender,
+        }
+
+        if event_type == "push":
+            ref = payload.get("ref", "")
+            branch = ref.replace("refs/heads/", "")
+            commits = payload.get("commits", [])
+            pusher = payload.get("pusher", {}).get("name", sender)
+            record["branch"] = branch
+            record["pusher"] = pusher
+            record["commit_count"] = len(commits)
+            record["commits"] = [
+                {
+                    "sha": c["id"][:7],
+                    "message": c["message"].split("\n")[0][:72],
+                    "url": c["url"],
+                }
+                for c in commits[:15]
+            ]
+            record["compare_url"] = payload.get("compare", "")
+
+        elif event_type == "pull_request":
+            pr = payload.get("pull_request", {})
+            record["action"] = payload.get("action", "")
+            record["pr_number"] = pr.get("number", "?")
+            record["pr_title"] = pr.get("title", "")
+            record["pr_url"] = pr.get("html_url", "")
+            record["head"] = pr.get("head", {}).get("ref", "")
+            record["base"] = pr.get("base", {}).get("ref", "")
+            record["merged"] = pr.get("merged", False)
+            record["additions"] = pr.get("additions", 0)
+            record["deletions"] = pr.get("deletions", 0)
+            record["changed_files"] = pr.get("changed_files", 0)
+
+        elif event_type == "create":
+            record["ref_type"] = payload.get("ref_type", "")
+            record["ref"] = payload.get("ref", "")
+
+        elif event_type == "delete":
+            record["ref_type"] = payload.get("ref_type", "")
+            record["ref"] = payload.get("ref", "")
+
+        elif event_type == "issues":
+            issue = payload.get("issue", {})
+            record["action"] = payload.get("action", "")
+            record["issue_number"] = issue.get("number", "?")
+            record["issue_title"] = issue.get("title", "")
+            record["issue_url"] = issue.get("html_url", "")
+
+        elif event_type == "release":
+            release = payload.get("release", {})
+            record["action"] = payload.get("action", "")
+            record["tag"] = release.get("tag_name", "")
+            record["release_name"] = release.get("name", "")
+            record["release_url"] = release.get("html_url", "")
+
+        self.event_buffer.append(record)
+
+    def drain_buffer(self) -> list[dict]:
+        """Return all buffered events and clear the buffer."""
+        events = self.event_buffer.copy()
+        self.event_buffer.clear()
+        return events
+
+    def peek_buffer(self) -> list[dict]:
+        """Return buffered events without clearing."""
+        return self.event_buffer.copy()
+
     async def process_event(self, event_type: str, payload: dict) -> None:
         """Called by the webhook server in bot.py when a GitHub event is received."""
+        # Buffer the event for digest (before posting)
+        if event_type != "ping":
+            self._buffer_event(event_type, payload)
+
+        # Post real-time embed to feed channel
         channel = self._get_channel()
         if not channel:
             self.bot.logger.warning("GITHUB_FEED_CHANNEL_ID not set or channel not found")
@@ -72,15 +158,16 @@ class GitHubFeed(commands.Cog, name="github_feed"):
             return
 
         if embed:
-            # Add repo footer to all embeds
             repo = payload.get("repository", {})
             if repo:
                 embed.set_footer(
                     text=repo.get("full_name", ""),
                     icon_url=repo.get("owner", {}).get("avatar_url", ""),
                 )
-            embed.timestamp = datetime.utcnow()
+            embed.timestamp = datetime.now(timezone.utc)
             await channel.send(embed=embed)
+
+    # ── Real-time embed builders ────────────────────────────────────
 
     def _build_push_embed(self, payload: dict) -> discord.Embed:
         commits = payload.get("commits", [])
@@ -129,7 +216,7 @@ class GitHubFeed(commands.Cog, name="github_feed"):
 
         color = COLORS["pull_request"]
         if action == "closed" and pr.get("merged"):
-            color = 0x8957E5  # Merged purple
+            color = 0x8957E5
 
         embed = discord.Embed(
             title=f"[{repo}] Pull request #{pr.get('number', '?')} {action_text}",
@@ -147,7 +234,7 @@ class GitHubFeed(commands.Cog, name="github_feed"):
         return embed
 
     def _build_create_embed(self, payload: dict) -> discord.Embed:
-        ref_type = payload.get("ref_type", "")  # branch or tag
+        ref_type = payload.get("ref_type", "")
         ref = payload.get("ref", "")
         repo = payload.get("repository", {}).get("full_name", "unknown")
         sender = payload.get("sender", {})
@@ -200,7 +287,6 @@ class GitHubFeed(commands.Cog, name="github_feed"):
         return embed
 
     def _build_comment_embed(self, payload: dict) -> discord.Embed:
-        action = payload.get("action", "")
         comment = payload.get("comment", {})
         issue = payload.get("issue", {})
         repo = payload.get("repository", {}).get("full_name", "unknown")
@@ -241,12 +327,16 @@ class GitHubFeed(commands.Cog, name="github_feed"):
         description="Show the latest GitHub activity summary.",
     )
     async def github_status(self, context: Context) -> None:
-        """Show which channel is receiving GitHub events."""
+        """Show which channel is receiving GitHub events and buffered event count."""
         channel = self._get_channel()
+        buffered = len(self.event_buffer)
         if channel:
             embed = discord.Embed(
                 title="GitHub Feed Status",
-                description=f"GitHub events are being posted to {channel.mention}",
+                description=(
+                    f"GitHub events are being posted to {channel.mention}\n"
+                    f"**{buffered}** events buffered for next rebase digest"
+                ),
                 color=0x2EA44F,
             )
         else:
