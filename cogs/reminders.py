@@ -3,9 +3,14 @@ Scheduled reminders cog for AdHub Bot.
 Sends rebase digest at 12:00 PM and 6:00 PM UTC+8 with a compiled
 summary of all GitHub activity since the last digest.
 
+Timeline per rebase:
+  T-30  Heads up — wrap up your work
+  T-10  Push to dev NOW
+  T-0   Rebase digest — pull from dev, rebase feature branches
+
 Schedule (fixed):
-  12:00 PM UTC+8  =  04:00 UTC  =  11:00 PM EST (prev day)  =  8:00 PM PST (prev day)
-   6:00 PM UTC+8  =  10:00 UTC  =   5:00 AM EST             =  2:00 AM PST
+  12:00 PM UTC+8  (warnings at 11:30 AM, 11:50 AM)
+   6:00 PM UTC+8  (warnings at  5:30 PM,  5:50 PM)
 """
 
 import os
@@ -66,10 +71,32 @@ class Reminders(commands.Cog, name="reminders"):
 
     @tasks.loop(minutes=1.0)
     async def rebase_reminder(self) -> None:
-        """Check every minute if it's time to send a rebase digest."""
+        """Check every minute for T-30 warning, T-10 push reminder, or T-0 rebase digest."""
         now = datetime.now(TZ_UTC8)
+        current = now.hour * 60 + now.minute  # minutes since midnight
+
         for rt in REMINDER_TIMES:
-            if now.hour == rt.hour and now.minute == rt.minute:
+            rebase_min = rt.hour * 60 + rt.minute
+            rebase_time_str = rt.strftime("%I:%M %p")
+
+            if current == rebase_min - 30:
+                await self._send_warning(
+                    title=f"Rebase in 30 minutes ({rebase_time_str} UTC+8)",
+                    message="Wrap up what you're working on. Push to `dev` within the next 20 minutes.",
+                    color=0x0969DA,  # Blue
+                )
+                break
+            elif current == rebase_min - 10:
+                await self._send_warning(
+                    title=f"Push to dev NOW — Rebase in 10 minutes ({rebase_time_str} UTC+8)",
+                    message=(
+                        "Push your changes to `dev` before the rebase.\n"
+                        "```git push origin dev```"
+                    ),
+                    color=0xE8A317,  # Orange
+                )
+                break
+            elif current == rebase_min:
                 await self._send_rebase_digest(now)
                 break
 
@@ -85,29 +112,31 @@ class Reminders(commands.Cog, name="reminders"):
             lines.append(f"**{label}:** {converted.strftime('%I:%M %p %b %d')}")
         return "\n".join(lines)
 
-    def _build_activity_digest(self, events: list[dict]) -> list[discord.Embed]:
-        """Build digest embeds from buffered GitHub events."""
+    def _build_activity_summary(self, events: list[dict]) -> str:
+        """Build a Design 1 (Clean & Compact) activity summary."""
         if not events:
-            return []
+            return ""
 
-        embeds = []
-
-        # ── Group pushes by user ──
-        pushes_by_user = defaultdict(lambda: {"branches": set(), "commit_count": 0, "commits": []})
+        # ── Group events ──
+        dev_pushes = defaultdict(lambda: {"commit_count": 0, "commits": []})
+        other_pushes = defaultdict(lambda: {"branches": set(), "commit_count": 0})
         prs = []
         branches_created = []
         branches_deleted = []
         issues_list = []
         releases = []
-        other_events = []
 
         for e in events:
             etype = e["type"]
             if etype == "push":
                 user = e.get("pusher", e["sender"])
-                pushes_by_user[user]["branches"].add(e.get("branch", "unknown"))
-                pushes_by_user[user]["commit_count"] += e.get("commit_count", 0)
-                pushes_by_user[user]["commits"].extend(e.get("commits", []))
+                branch = e.get("branch", "?")
+                if branch == "dev":
+                    dev_pushes[user]["commit_count"] += e.get("commit_count", 0)
+                    dev_pushes[user]["commits"].extend(e.get("commits", []))
+                else:
+                    other_pushes[user]["branches"].add(branch)
+                    other_pushes[user]["commit_count"] += e.get("commit_count", 0)
             elif etype == "pull_request":
                 prs.append(e)
             elif etype == "create":
@@ -118,130 +147,85 @@ class Reminders(commands.Cog, name="reminders"):
                 issues_list.append(e)
             elif etype == "release":
                 releases.append(e)
-            else:
-                other_events.append(e)
 
-        # ── Push summary embed ──
-        if pushes_by_user:
-            desc = ""
-            total_commits = 0
-            for user, data in pushes_by_user.items():
-                branches_str = ", ".join(f"`{b}`" for b in sorted(data["branches"]))
-                desc += f"**{user}** — {data['commit_count']} commits on {branches_str}\n"
+        desc = ""
 
-                # Show up to 5 commits per user
-                for c in data["commits"][:5]:
-                    desc += f"  [`{c['sha']}`]({c['url']}) {c['message']}\n"
-                if len(data["commits"]) > 5:
-                    desc += f"  ... and {len(data['commits']) - 5} more\n"
-                desc += "\n"
-                total_commits += data["commit_count"]
+        # ── Dev commits ──
+        if dev_pushes:
+            total = sum(d["commit_count"] for d in dev_pushes.values())
+            desc += f"**Commits to `dev`** ({total})\n"
+            for user, data in dev_pushes.items():
+                desc += f"> **{user}** pushed {data['commit_count']}\n"
+                for c in data["commits"][:3]:
+                    desc += f"> `{c['sha']}` {c['message']}\n"
+                if len(data["commits"]) > 3:
+                    remaining = len(data["commits"]) - 3
+                    desc += f"> *... +{remaining} more*\n"
+            desc += "\n"
 
-            push_embed = discord.Embed(
-                title=f"Pushes — {total_commits} commits by {len(pushes_by_user)} dev{'s' if len(pushes_by_user) != 1 else ''}",
-                description=desc[:4096],
-                color=0x2EA44F,
-            )
-            embeds.append(push_embed)
-
-        # ── PR summary embed ──
+        # ── PRs ──
         if prs:
-            desc = ""
+            desc += f"**Pull Requests** ({len(prs)})\n"
             for pr in prs:
                 action = pr.get("action", "")
                 if action == "closed" and pr.get("merged"):
-                    icon = "merged"
-                elif action == "opened":
-                    icon = "opened"
-                elif action == "closed":
-                    icon = "closed"
-                else:
-                    icon = action
+                    action = "merged"
+                desc += f"> #{pr['pr_number']} {pr['pr_title']} (*{action}*)\n"
+            desc += "\n"
 
-                desc += (
-                    f"[#{pr['pr_number']}]({pr['pr_url']}) **{pr['pr_title']}** "
-                    f"({icon}) by {pr['sender']}\n"
-                    f"  `{pr.get('head', '?')}` -> `{pr.get('base', '?')}` "
-                    f"| +{pr.get('additions', 0)} -{pr.get('deletions', 0)} "
-                    f"({pr.get('changed_files', 0)} files)\n\n"
-                )
-
-            pr_embed = discord.Embed(
-                title=f"Pull Requests — {len(prs)} PR{'s' if len(prs) != 1 else ''}",
-                description=desc[:4096],
-                color=0x6F42C1,
-            )
-            embeds.append(pr_embed)
-
-        # ── Branches created/deleted ──
-        branch_lines = []
-        for b in branches_created:
-            branch_lines.append(f"+ `{b.get('ref', '?')}` created by {b['sender']}")
-        for b in branches_deleted:
-            branch_lines.append(f"- `{b.get('ref', '?')}` deleted by {b['sender']}")
-
-        if branch_lines:
-            branch_embed = discord.Embed(
-                title=f"Branches — {len(branch_lines)} change{'s' if len(branch_lines) != 1 else ''}",
-                description="\n".join(branch_lines)[:4096],
-                color=0x0969DA,
-            )
-            embeds.append(branch_embed)
+        # ── Branches ──
+        if branches_created or branches_deleted:
+            items = [f"+ `{b.get('ref', '?')}`" for b in branches_created]
+            items += [f"- `{b.get('ref', '?')}`" for b in branches_deleted]
+            desc += f"**Branches** {' '.join(items)}\n"
 
         # ── Issues ──
         if issues_list:
-            desc = ""
             for iss in issues_list:
-                desc += (
-                    f"[#{iss['issue_number']}]({iss['issue_url']}) "
-                    f"**{iss['issue_title']}** ({iss.get('action', '')}) "
-                    f"by {iss['sender']}\n"
-                )
-            issue_embed = discord.Embed(
-                title=f"Issues — {len(issues_list)}",
-                description=desc[:4096],
-                color=0xE8A317,
-            )
-            embeds.append(issue_embed)
+                desc += f"**Issue** #{iss['issue_number']} {iss['issue_title']} (*{iss.get('action', '')}*)\n"
 
         # ── Releases ──
         if releases:
-            desc = ""
             for rel in releases:
-                desc += (
-                    f"[{rel.get('tag', '')}]({rel.get('release_url', '')}) "
-                    f"**{rel.get('release_name', '')}** ({rel.get('action', '')}) "
-                    f"by {rel['sender']}\n"
-                )
-            release_embed = discord.Embed(
-                title=f"Releases — {len(releases)}",
-                description=desc[:4096],
-                color=0xFFD700,
-            )
-            embeds.append(release_embed)
+                desc += f"**Release** {rel.get('tag', '?')} (*{rel.get('action', '')}*)\n"
 
-        return embeds
+        # ── Other branches — small text ──
+        if other_pushes:
+            total = sum(d["commit_count"] for d in other_pushes.values())
+            parts = []
+            for user, data in other_pushes.items():
+                branches_str = ", ".join(sorted(data["branches"]))
+                parts.append(f"{user}: {data['commit_count']} on {branches_str}")
+            joiner = " | ".join(parts)
+            desc += f"\n-# Other branches ({total} commits): {joiner}"
 
-    async def _send_rebase_digest(self, now: datetime) -> None:
-        """Send the rebase digest: compiled activity + reminder."""
+        return desc
+
+    async def _send_warning(self, title: str, message: str, color: int, suppress_ping: bool = False) -> None:
+        """Send a short warning embed to the reminders channel."""
+        channel = self._get_channel()
+        if not channel:
+            return
+        ping = None if suppress_ping else self._get_ping()
+        embed = discord.Embed(title=title, description=message, color=color)
+        await channel.send(content=ping, embed=embed)
+
+    async def _send_rebase_digest(self, now: datetime, suppress_ping: bool = False) -> None:
+        """Send the rebase digest as a single compact embed (Design 1)."""
         channel = self._get_channel()
         if not channel:
             self.bot.logger.warning("REMINDERS_CHANNEL_ID not set or channel not found")
             return
 
-        ping = self._get_ping()
+        ping = None if suppress_ping else self._get_ping()
 
         # Determine session label
         if now.hour == 12:
             session = "Midday"
             color = 0xE8A317  # Orange
-            msg = "Lunch break rebase! Sync with `dev` before the afternoon push."
         else:
             session = "End of Day"
             color = 0xCF222E  # Red
-            msg = "EOD rebase checkpoint! Sync with `dev` before wrapping up for the day."
-
-        tz_display = self._build_timezone_string(now)
 
         # ── Drain the event buffer from github_feed cog ──
         github_cog = self.bot.get_cog("github_feed")
@@ -249,41 +233,24 @@ class Reminders(commands.Cog, name="reminders"):
         if github_cog:
             events = github_cog.drain_buffer()
 
-        # ── Build the header embed ──
-        header_desc = (
-            f"**{msg}**\n\n"
-            f"**Schedule across timezones:**\n{tz_display}\n\n"
-        )
+        # ── Build Design 1 embed ──
+        desc = "```git fetch origin && git rebase origin/dev```\n"
 
-        if events:
-            header_desc += f"**{len(events)} events** since last digest:\n"
+        activity = self._build_activity_summary(events)
+        if activity:
+            desc += activity
         else:
-            header_desc += "No GitHub activity since the last digest.\n"
+            desc += "*No activity since last digest.*"
 
-        header_desc += (
-            "\n```bash\n"
-            "# From your feature branch:\n"
-            "git fetch origin\n"
-            "git rebase origin/dev\n"
-            "# Resolve any conflicts, then:\n"
-            "git push --force-with-lease\n"
-            "```"
-        )
-
-        header_embed = discord.Embed(
-            title=f"Rebase Digest — {session} ({now.strftime('%I:%M %p')} UTC+8)",
-            description=header_desc,
+        embed = discord.Embed(
+            title=f"Rebase — {session} ({now.strftime('%I:%M %p')} UTC+8)",
+            description=desc[:4096],
             color=color,
         )
-        header_embed.set_footer(text="Use /rebase-schedule to view schedule | /rebase-now to trigger manually")
-        header_embed.timestamp = now
+        embed.set_footer(text="/rebase-now \u2022 /rebase-schedule \u2022 /activity-preview")
+        embed.timestamp = now
 
-        # ── Build activity digest embeds ──
-        activity_embeds = self._build_activity_digest(events)
-
-        # ── Send everything (Discord allows up to 10 embeds per message) ──
-        all_embeds = [header_embed] + activity_embeds[:9]  # Cap at 10 total
-        await channel.send(content=ping, embeds=all_embeds)
+        await channel.send(content=ping, embeds=[embed])
 
     # ── Slash commands ──────────────────────────────────────────────
 
@@ -319,7 +286,7 @@ class Reminders(commands.Cog, name="reminders"):
             ),
             color=0x2EA44F,
         )
-        embed.set_footer(text="Reminders fire at 12:00 PM and 6:00 PM UTC+8 daily")
+        embed.set_footer(text="Warnings at T-30 and T-10 | Rebase at 12:00 PM and 6:00 PM UTC+8")
         await context.send(embed=embed)
 
     @commands.hybrid_command(
@@ -354,14 +321,14 @@ class Reminders(commands.Cog, name="reminders"):
             await context.send(embed=embed, ephemeral=True)
             return
 
-        activity_embeds = self._build_activity_digest(events)
-        preview_header = discord.Embed(
+        activity = self._build_activity_summary(events)
+        embed = discord.Embed(
             title=f"Activity Preview — {len(events)} events buffered",
-            description="This is what will be included in the next rebase digest. Events are NOT cleared by this preview.",
+            description=activity or "No events.",
             color=0x0969DA,
         )
-        all_embeds = [preview_header] + activity_embeds[:9]
-        await context.send(embeds=all_embeds, ephemeral=True)
+        embed.set_footer(text="Events are NOT cleared by this preview.")
+        await context.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot) -> None:

@@ -1,32 +1,18 @@
 """
-GitHub webhook feed cog for AdHub Bot.
-Receives GitHub events from the webhook server in bot.py and:
-  1. Posts individual event embeds to the feed channel (real-time)
-  2. Buffers events for the rebase reminder digest
+GitHub feed cog for AdHub Bot.
+Listens for embeds posted by the official Discord GitHub integration
+in the feed channel, parses them, and buffers events for the rebase
+reminder digest.
 """
 
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands import Context
-
-
-# Embed colors per event type
-COLORS = {
-    "push": 0x2EA44F,       # GitHub green
-    "pull_request": 0x6F42C1,  # Purple
-    "create": 0x0969DA,     # Blue
-    "delete": 0xCF222E,     # Red
-    "issues": 0xE8A317,     # Orange
-    "issue_comment": 0xE8A317,
-    "release": 0xFFD700,    # Gold
-    "star": 0xFFD700,
-    "fork": 0x0969DA,
-    "ping": 0x808080,       # Gray
-}
 
 
 class GitHubFeed(commands.Cog, name="github_feed"):
@@ -34,80 +20,70 @@ class GitHubFeed(commands.Cog, name="github_feed"):
         self.bot = bot
         # Event buffer for rebase digest - list of dicts
         self.event_buffer = []
+        self._backfilled = False
+
+    @commands.Cog.listener("on_ready")
+    async def on_ready_backfill(self) -> None:
+        """Backfill missed events from channel history on startup."""
+        await self._backfill()
+
+    @staticmethod
+    def _last_rebase_time() -> datetime:
+        """Calculate the most recent scheduled rebase time (12 PM or 6 PM UTC+8)."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Manila")
+        now = datetime.now(tz)
+        # Rebase times in UTC+8: 12:00, 18:00
+        rebase_hours = [12, 18]
+
+        for h in sorted(rebase_hours, reverse=True):
+            candidate = now.replace(hour=h, minute=0, second=0, microsecond=0)
+            if candidate <= now:
+                return candidate.astimezone(timezone.utc)
+
+        # Before 12 PM today — last rebase was 6 PM yesterday
+        yesterday = now - timedelta(days=1)
+        return yesterday.replace(hour=18, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+    async def _backfill(self) -> None:
+        """Scan feed channel messages since last rebase and parse missed GitHub embeds."""
+        if self._backfilled:
+            return
+        self._backfilled = True
+
+        channel = self._get_channel()
+        if not channel:
+            return
+
+        cutoff = self._last_rebase_time()
+        count = 0
+        self.bot.logger.info(f"Backfilling GitHub events since {cutoff.isoformat()}")
+
+        async for message in channel.history(after=cutoff, limit=200, oldest_first=True):
+            if not message.author.bot:
+                continue
+            if not message.embeds:
+                continue
+            for embed in message.embeds:
+                record = self._parse_github_embed(embed)
+                if record:
+                    # Use the message timestamp instead of now
+                    record["timestamp"] = message.created_at
+                    self.event_buffer.append(record)
+                    count += 1
+
+        if count:
+            self.bot.logger.info(f"Backfilled {count} GitHub events from channel history")
 
     def _get_channel(self):
         channel_id = os.getenv("GITHUB_FEED_CHANNEL_ID")
         if not channel_id:
             return None
         return self.bot.get_channel(int(channel_id))
-
-    def _buffer_event(self, event_type: str, payload: dict) -> None:
-        """Store a simplified event record for the rebase digest."""
-        now = datetime.now(timezone.utc)
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        sender = payload.get("sender", {}).get("login", "unknown")
-
-        record = {
-            "type": event_type,
-            "timestamp": now,
-            "repo": repo,
-            "sender": sender,
-        }
-
-        if event_type == "push":
-            ref = payload.get("ref", "")
-            branch = ref.replace("refs/heads/", "")
-            commits = payload.get("commits", [])
-            pusher = payload.get("pusher", {}).get("name", sender)
-            record["branch"] = branch
-            record["pusher"] = pusher
-            record["commit_count"] = len(commits)
-            record["commits"] = [
-                {
-                    "sha": c["id"][:7],
-                    "message": c["message"].split("\n")[0][:72],
-                    "url": c["url"],
-                }
-                for c in commits[:15]
-            ]
-            record["compare_url"] = payload.get("compare", "")
-
-        elif event_type == "pull_request":
-            pr = payload.get("pull_request", {})
-            record["action"] = payload.get("action", "")
-            record["pr_number"] = pr.get("number", "?")
-            record["pr_title"] = pr.get("title", "")
-            record["pr_url"] = pr.get("html_url", "")
-            record["head"] = pr.get("head", {}).get("ref", "")
-            record["base"] = pr.get("base", {}).get("ref", "")
-            record["merged"] = pr.get("merged", False)
-            record["additions"] = pr.get("additions", 0)
-            record["deletions"] = pr.get("deletions", 0)
-            record["changed_files"] = pr.get("changed_files", 0)
-
-        elif event_type == "create":
-            record["ref_type"] = payload.get("ref_type", "")
-            record["ref"] = payload.get("ref", "")
-
-        elif event_type == "delete":
-            record["ref_type"] = payload.get("ref_type", "")
-            record["ref"] = payload.get("ref", "")
-
-        elif event_type == "issues":
-            issue = payload.get("issue", {})
-            record["action"] = payload.get("action", "")
-            record["issue_number"] = issue.get("number", "?")
-            record["issue_title"] = issue.get("title", "")
-            record["issue_url"] = issue.get("html_url", "")
-
-        elif event_type == "release":
-            release = payload.get("release", {})
-            record["action"] = payload.get("action", "")
-            record["tag"] = release.get("tag_name", "")
-            record["release_name"] = release.get("name", "")
-            record["release_url"] = release.get("html_url", "")
-
-        self.event_buffer.append(record)
 
     def drain_buffer(self) -> list[dict]:
         """Return all buffered events and clear the buffer."""
@@ -119,208 +95,213 @@ class GitHubFeed(commands.Cog, name="github_feed"):
         """Return buffered events without clearing."""
         return self.event_buffer.copy()
 
-    async def process_event(self, event_type: str, payload: dict) -> None:
-        """Called by the webhook server in bot.py when a GitHub event is received."""
-        # Buffer the event for digest (before posting)
-        if event_type != "ping":
-            self._buffer_event(event_type, payload)
+    # ── Listen for GitHub integration embeds ───────────────────────
 
-        # Post real-time embed to feed channel
-        channel = self._get_channel()
-        if not channel:
-            self.bot.logger.warning("GITHUB_FEED_CHANNEL_ID not set or channel not found")
+    @commands.Cog.listener("on_message")
+    async def on_github_embed(self, message: discord.Message) -> None:
+        """Parse embeds posted by the Discord GitHub integration."""
+        channel_id = os.getenv("GITHUB_FEED_CHANNEL_ID")
+        if not channel_id:
             return
 
-        embed = None
-
-        if event_type == "push":
-            embed = self._build_push_embed(payload)
-        elif event_type == "pull_request":
-            embed = self._build_pr_embed(payload)
-        elif event_type == "create":
-            embed = self._build_create_embed(payload)
-        elif event_type == "delete":
-            embed = self._build_delete_embed(payload)
-        elif event_type == "issues":
-            embed = self._build_issue_embed(payload)
-        elif event_type == "issue_comment":
-            embed = self._build_comment_embed(payload)
-        elif event_type == "release":
-            embed = self._build_release_embed(payload)
-        elif event_type == "ping":
-            embed = discord.Embed(
-                title="Webhook Connected",
-                description=f"GitHub webhook successfully connected for **{payload.get('repository', {}).get('full_name', 'unknown')}**",
-                color=COLORS["ping"],
-            )
-        else:
-            self.bot.logger.info(f"Unhandled GitHub event: {event_type}")
+        # Only listen in the feed channel
+        if message.channel.id != int(channel_id):
             return
 
-        if embed:
-            repo = payload.get("repository", {})
-            if repo:
-                embed.set_footer(
-                    text=repo.get("full_name", ""),
-                    icon_url=repo.get("owner", {}).get("avatar_url", ""),
+        # Only process bot/webhook messages (GitHub integration posts as an app)
+        if not message.author.bot:
+            return
+
+        if not message.embeds:
+            return
+
+        for embed in message.embeds:
+            record = self._parse_github_embed(embed)
+            if record:
+                self.event_buffer.append(record)
+                self.bot.logger.info(
+                    f"Buffered GitHub event: {record['type']} from {record.get('sender', 'unknown')}"
                 )
-            embed.timestamp = datetime.now(timezone.utc)
-            await channel.send(embed=embed)
 
-    # ── Real-time embed builders ────────────────────────────────────
+    def _parse_github_embed(self, embed: discord.Embed) -> Optional[dict]:
+        """Parse a Discord GitHub integration embed into a buffer record."""
+        title = embed.title or ""
+        description = embed.description or ""
+        url = str(embed.url) if embed.url else ""
+        author_name = embed.author.name if embed.author else "unknown"
+        now = datetime.now(timezone.utc)
 
-    def _build_push_embed(self, payload: dict) -> discord.Embed:
-        commits = payload.get("commits", [])
-        ref = payload.get("ref", "")
-        branch = ref.replace("refs/heads/", "")
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        pusher = payload.get("pusher", {}).get("name", "unknown")
-        compare_url = payload.get("compare", "")
+        # ── Push: "[repo:branch] N new commit(s)" ──
+        push_match = re.match(r"\[(.+):(.+)\] (\d+) new commits?", title)
+        if push_match:
+            repo = push_match.group(1)
+            branch = push_match.group(2)
+            commit_count = int(push_match.group(3))
 
-        commit_list = ""
-        for c in commits[:10]:
-            sha_short = c["id"][:7]
-            msg = c["message"].split("\n")[0][:72]
-            commit_list += f"[`{sha_short}`]({c['url']}) {msg}\n"
+            # Parse commit lines from description: "`sha` message - author"
+            commits = []
+            for line in description.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: [`sha`](url) message - author
+                # or simpler: `sha` message
+                commit_match = re.match(
+                    r"\[`([a-f0-9]+)`\]\(([^)]+)\)\s+(.+?)(?:\s+-\s+.+)?$", line
+                )
+                if commit_match:
+                    commits.append({
+                        "sha": commit_match.group(1),
+                        "url": commit_match.group(2),
+                        "message": commit_match.group(3).strip(),
+                    })
+                else:
+                    # Fallback: plain text commit line
+                    plain_match = re.match(r"`([a-f0-9]+)`\s+(.+?)(?:\s+-\s+.+)?$", line)
+                    if plain_match:
+                        commits.append({
+                            "sha": plain_match.group(1),
+                            "url": url,
+                            "message": plain_match.group(2).strip(),
+                        })
 
-        if len(commits) > 10:
-            commit_list += f"... and {len(commits) - 10} more commits\n"
+            return {
+                "type": "push",
+                "timestamp": now,
+                "repo": repo,
+                "sender": author_name,
+                "branch": branch,
+                "pusher": author_name,
+                "commit_count": commit_count,
+                "commits": commits[:15],
+                "compare_url": url,
+            }
 
-        embed = discord.Embed(
-            title=f"[{repo}:{branch}] {len(commits)} new commit{'s' if len(commits) != 1 else ''}",
-            description=commit_list or "No commits",
-            url=compare_url,
-            color=COLORS["push"],
+        # ── Pull Request: title contains "pull request" ──
+        pr_match = re.match(
+            r"\[(.+)\] Pull request #(\d+)\s+(.+?):\s+(.+)", title, re.IGNORECASE
         )
-        embed.set_author(
-            name=pusher,
-            icon_url=payload.get("sender", {}).get("avatar_url", ""),
+        if pr_match:
+            return {
+                "type": "pull_request",
+                "timestamp": now,
+                "repo": pr_match.group(1),
+                "sender": author_name,
+                "action": pr_match.group(3).strip().lower(),
+                "pr_number": int(pr_match.group(2)),
+                "pr_title": pr_match.group(4).strip(),
+                "pr_url": url,
+                "head": "",
+                "base": "",
+                "merged": "merged" in title.lower(),
+                "additions": 0,
+                "deletions": 0,
+                "changed_files": 0,
+            }
+
+        # Simpler PR pattern: "[repo] Pull request opened: #N title"
+        pr_match2 = re.match(
+            r"\[(.+)\] Pull request (\w+)\s*(?:#(\d+))?\s*(.*)", title, re.IGNORECASE
         )
-        return embed
+        if pr_match2:
+            pr_num_str = pr_match2.group(3) or "0"
+            return {
+                "type": "pull_request",
+                "timestamp": now,
+                "repo": pr_match2.group(1),
+                "sender": author_name,
+                "action": pr_match2.group(2).strip().lower(),
+                "pr_number": int(pr_num_str),
+                "pr_title": pr_match2.group(4).strip(),
+                "pr_url": url,
+                "head": "",
+                "base": "",
+                "merged": "merged" in title.lower(),
+                "additions": 0,
+                "deletions": 0,
+                "changed_files": 0,
+            }
 
-    def _build_pr_embed(self, payload: dict) -> discord.Embed:
-        action = payload.get("action", "")
-        pr = payload.get("pull_request", {})
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        user = pr.get("user", {})
-        base = pr.get("base", {}).get("ref", "")
-        head = pr.get("head", {}).get("ref", "")
-
-        action_text = {
-            "opened": "opened",
-            "closed": "merged" if pr.get("merged") else "closed",
-            "reopened": "reopened",
-            "synchronize": "updated",
-            "ready_for_review": "marked ready for review",
-        }.get(action, action)
-
-        color = COLORS["pull_request"]
-        if action == "closed" and pr.get("merged"):
-            color = 0x8957E5
-
-        embed = discord.Embed(
-            title=f"[{repo}] Pull request #{pr.get('number', '?')} {action_text}",
-            description=f"**{pr.get('title', '')}**\n`{head}` -> `{base}`\n\n{(pr.get('body') or '')[:300]}",
-            url=pr.get("html_url", ""),
-            color=color,
+        # ── Issue: title contains "Issue" ──
+        issue_match = re.match(
+            r"\[(.+)\] Issue #(\d+)\s+(.+?):\s+(.+)", title, re.IGNORECASE
         )
-        embed.set_author(
-            name=user.get("login", "unknown"),
-            icon_url=user.get("avatar_url", ""),
-        )
-        embed.add_field(name="Additions", value=f"+{pr.get('additions', 0)}", inline=True)
-        embed.add_field(name="Deletions", value=f"-{pr.get('deletions', 0)}", inline=True)
-        embed.add_field(name="Files", value=str(pr.get("changed_files", 0)), inline=True)
-        return embed
+        if not issue_match:
+            issue_match = re.match(
+                r"\[(.+)\] Issue (\w+)\s*(?:#(\d+))?\s*(.*)", title, re.IGNORECASE
+            )
+            if issue_match:
+                return {
+                    "type": "issues",
+                    "timestamp": now,
+                    "repo": issue_match.group(1),
+                    "sender": author_name,
+                    "action": issue_match.group(2).strip().lower(),
+                    "issue_number": int(issue_match.group(3) or 0),
+                    "issue_title": issue_match.group(4).strip(),
+                    "issue_url": url,
+                }
+        if issue_match:
+            return {
+                "type": "issues",
+                "timestamp": now,
+                "repo": issue_match.group(1),
+                "sender": author_name,
+                "action": issue_match.group(3).strip().lower(),
+                "issue_number": int(issue_match.group(2)),
+                "issue_title": issue_match.group(4).strip(),
+                "issue_url": url,
+            }
 
-    def _build_create_embed(self, payload: dict) -> discord.Embed:
-        ref_type = payload.get("ref_type", "")
-        ref = payload.get("ref", "")
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        sender = payload.get("sender", {})
+        # ── Create: title contains "created" ──
+        create_match = re.match(
+            r"\[(.+)\] New (\w+) created: `?(.+?)`?$", title, re.IGNORECASE
+        )
+        if create_match:
+            return {
+                "type": "create",
+                "timestamp": now,
+                "repo": create_match.group(1),
+                "sender": author_name,
+                "ref_type": create_match.group(2),
+                "ref": create_match.group(3),
+            }
 
-        embed = discord.Embed(
-            title=f"[{repo}] New {ref_type} created: `{ref}`",
-            color=COLORS["create"],
+        # ── Delete: title contains "deleted" ──
+        delete_match = re.match(
+            r"\[(.+)\] (\w+) deleted: `?(.+?)`?$", title, re.IGNORECASE
         )
-        embed.set_author(
-            name=sender.get("login", "unknown"),
-            icon_url=sender.get("avatar_url", ""),
-        )
-        return embed
+        if delete_match:
+            return {
+                "type": "delete",
+                "timestamp": now,
+                "repo": delete_match.group(1),
+                "sender": author_name,
+                "ref_type": delete_match.group(2).lower(),
+                "ref": delete_match.group(3),
+            }
 
-    def _build_delete_embed(self, payload: dict) -> discord.Embed:
-        ref_type = payload.get("ref_type", "")
-        ref = payload.get("ref", "")
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        sender = payload.get("sender", {})
+        # ── Release: title contains "Release" ──
+        release_match = re.match(
+            r"\[(.+)\] (?:New )?[Rr]elease (.+?)(?:\s+(published|created|drafted))?$",
+            title,
+        )
+        if release_match:
+            return {
+                "type": "release",
+                "timestamp": now,
+                "repo": release_match.group(1),
+                "sender": author_name,
+                "tag": release_match.group(2).strip(),
+                "release_name": release_match.group(2).strip(),
+                "release_url": url,
+                "action": release_match.group(3) or "published",
+            }
 
-        embed = discord.Embed(
-            title=f"[{repo}] {ref_type.capitalize()} deleted: `{ref}`",
-            color=COLORS["delete"],
-        )
-        embed.set_author(
-            name=sender.get("login", "unknown"),
-            icon_url=sender.get("avatar_url", ""),
-        )
-        return embed
+        # Unknown embed — skip
+        return None
 
-    def _build_issue_embed(self, payload: dict) -> discord.Embed:
-        action = payload.get("action", "")
-        issue = payload.get("issue", {})
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        user = issue.get("user", {})
-
-        embed = discord.Embed(
-            title=f"[{repo}] Issue #{issue.get('number', '?')} {action}",
-            description=f"**{issue.get('title', '')}**\n\n{(issue.get('body') or '')[:300]}",
-            url=issue.get("html_url", ""),
-            color=COLORS["issues"],
-        )
-        embed.set_author(
-            name=user.get("login", "unknown"),
-            icon_url=user.get("avatar_url", ""),
-        )
-        labels = [l["name"] for l in issue.get("labels", [])]
-        if labels:
-            embed.add_field(name="Labels", value=", ".join(labels), inline=True)
-        return embed
-
-    def _build_comment_embed(self, payload: dict) -> discord.Embed:
-        comment = payload.get("comment", {})
-        issue = payload.get("issue", {})
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        user = comment.get("user", {})
-
-        embed = discord.Embed(
-            title=f"[{repo}] Comment on #{issue.get('number', '?')}: {issue.get('title', '')}",
-            description=(comment.get("body") or "")[:500],
-            url=comment.get("html_url", ""),
-            color=COLORS["issue_comment"],
-        )
-        embed.set_author(
-            name=user.get("login", "unknown"),
-            icon_url=user.get("avatar_url", ""),
-        )
-        return embed
-
-    def _build_release_embed(self, payload: dict) -> discord.Embed:
-        action = payload.get("action", "")
-        release = payload.get("release", {})
-        repo = payload.get("repository", {}).get("full_name", "unknown")
-        author = release.get("author", {})
-
-        embed = discord.Embed(
-            title=f"[{repo}] Release {release.get('tag_name', '')} {action}",
-            description=f"**{release.get('name', '')}**\n\n{(release.get('body') or '')[:500]}",
-            url=release.get("html_url", ""),
-            color=COLORS["release"],
-        )
-        embed.set_author(
-            name=author.get("login", "unknown"),
-            icon_url=author.get("avatar_url", ""),
-        )
-        return embed
+    # ── Commands ───────────────────────────────────────────────────
 
     @commands.hybrid_command(
         name="github-status",
@@ -334,7 +315,7 @@ class GitHubFeed(commands.Cog, name="github_feed"):
             embed = discord.Embed(
                 title="GitHub Feed Status",
                 description=(
-                    f"GitHub events are being posted to {channel.mention}\n"
+                    f"GitHub events are being read from {channel.mention}\n"
                     f"**{buffered}** events buffered for next rebase digest"
                 ),
                 color=0x2EA44F,
