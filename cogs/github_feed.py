@@ -29,7 +29,7 @@ class GitHubFeed(commands.Cog, name="github_feed"):
 
     @staticmethod
     def _last_rebase_time() -> datetime:
-        """Calculate the most recent scheduled rebase time (12 PM or 6 PM UTC+8)."""
+        """Calculate the most recent scheduled rebase time (12 AM or 6 PM UTC+8)."""
         try:
             from zoneinfo import ZoneInfo
         except ImportError:
@@ -37,15 +37,15 @@ class GitHubFeed(commands.Cog, name="github_feed"):
 
         tz = ZoneInfo("Asia/Manila")
         now = datetime.now(tz)
-        # Rebase times in UTC+8: 12:00, 18:00
-        rebase_hours = [12, 18]
+        # Rebase times in UTC+8: 00:00 (midnight), 18:00
+        rebase_hours = [0, 18]
 
         for h in sorted(rebase_hours, reverse=True):
             candidate = now.replace(hour=h, minute=0, second=0, microsecond=0)
             if candidate <= now:
                 return candidate.astimezone(timezone.utc)
 
-        # Before 12 PM today — last rebase was 6 PM yesterday
+        # Before midnight today — last rebase was 6 PM yesterday
         yesterday = now - timedelta(days=1)
         return yesterday.replace(hour=18, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 

@@ -65,7 +65,7 @@ It is recommended to use slash commands and therefore not use prefix commands.
 
 If you want to use prefix commands, make sure to also enable the intent below in the Discord developer portal.
 """
-# intents.message_content = True
+intents.message_content = True
 
 # Setup both of the loggers
 
@@ -177,11 +177,20 @@ class DiscordBot(commands.Bot):
             discord.Activity(type=discord.ActivityType.watching, name="for merge conflicts"),
             discord.Activity(type=discord.ActivityType.watching, name="the CI pipeline"),
             discord.Activity(type=discord.ActivityType.watching, name="over AdHub repos"),
+            discord.Activity(type=discord.ActivityType.watching, name="you git push --force"),
+            discord.Activity(type=discord.ActivityType.watching, name="someone forget to pull"),
+            discord.Activity(type=discord.ActivityType.watching, name="the intern's first PR"),
+            discord.Activity(type=discord.ActivityType.watching, name="prod logs with anxiety"),
+            discord.Activity(type=discord.ActivityType.watching, name="Stack Overflow tabs"),
             # Listening (shows music note icon)
             discord.Activity(type=discord.ActivityType.listening, name="git push sounds"),
             discord.Activity(type=discord.ActivityType.listening, name="keyboard clacking"),
             discord.Activity(type=discord.ActivityType.listening, name="rebase prayers"),
             discord.Activity(type=discord.ActivityType.listening, name="deploy webhooks"),
+            discord.Activity(type=discord.ActivityType.listening, name="'it works on my machine'"),
+            discord.Activity(type=discord.ActivityType.listening, name="npm audit warnings"),
+            discord.Activity(type=discord.ActivityType.listening, name="404 screams"),
+            discord.Activity(type=discord.ActivityType.listening, name="the sound of tests passing"),
             # Playing (shows gamepad icon)
             discord.Game("with git rebase"),
             discord.Game("merge conflict simulator"),
@@ -189,11 +198,24 @@ class DiscordBot(commands.Bot):
             discord.Game("who broke dev?"),
             discord.Game("bug squasher 3000"),
             discord.Game("npm install forever"),
+            discord.Game("404: game not found"),
+            discord.Game("mass rename variables"),
+            discord.Game("delete node_modules speedrun"),
+            discord.Game("guess the error message"),
+            discord.Game("prod debugging at 3am"),
+            discord.Game("JIRA ticket bingo"),
+            discord.Game("fix one bug, create two"),
+            discord.Game("console.log('here')"),
+            discord.Game("undefined is not a function"),
+            discord.Game("it works, don't touch it"),
             # Competing (shows trophy icon)
             discord.Activity(type=discord.ActivityType.competing, name="a code review"),
             discord.Activity(type=discord.ActivityType.competing, name="sprint planning"),
             discord.Activity(type=discord.ActivityType.competing, name="the commit race"),
             discord.Activity(type=discord.ActivityType.competing, name="hotfix speedrun"),
+            discord.Activity(type=discord.ActivityType.competing, name="longest PR description"),
+            discord.Activity(type=discord.ActivityType.competing, name="most tabs open"),
+            discord.Activity(type=discord.ActivityType.competing, name="who can mass rename"),
         ]
         await self.change_presence(activity=random.choice(statuses))
 
