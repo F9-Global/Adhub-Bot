@@ -1,6 +1,6 @@
 """
 Scheduled reminders cog for AdHub Bot.
-Sends rebase digest at 12:00 PM and 6:00 PM UTC+8 with a compiled
+Sends rebase digest at 12:00 AM and 6:00 PM UTC+8 with a compiled
 summary of all GitHub activity since the last digest.
 
 Timeline per rebase:
@@ -9,7 +9,7 @@ Timeline per rebase:
   T-0   Rebase digest — pull from dev, rebase feature branches
 
 Schedule (fixed):
-  12:00 PM UTC+8  (warnings at 11:30 AM, 11:50 AM)
+  12:00 AM UTC+8  (warnings at 11:30 PM, 11:50 PM)
    6:00 PM UTC+8  (warnings at  5:30 PM,  5:50 PM)
 """
 
@@ -32,8 +32,8 @@ TZ_UTC8 = ZoneInfo("Asia/Manila")
 
 # Fixed rebase reminder times in UTC+8
 REMINDER_TIMES = [
-    time(hour=12, minute=0, tzinfo=TZ_UTC8),  # 12:00 PM UTC+8
-    time(hour=18, minute=0, tzinfo=TZ_UTC8),  # 6:00 PM UTC+8
+    time(hour=0, minute=0, tzinfo=TZ_UTC8),   # 12:00 AM UTC+8
+    time(hour=18, minute=0, tzinfo=TZ_UTC8),   # 6:00 PM UTC+8
 ]
 
 # Timezone display table for the embed
@@ -220,8 +220,8 @@ class Reminders(commands.Cog, name="reminders"):
         ping = None if suppress_ping else self._get_ping()
 
         # Determine session label
-        if now.hour == 12:
-            session = "Midday"
+        if now.hour == 0:
+            session = "Midnight"
             color = 0xE8A317  # Orange
         else:
             session = "End of Day"
@@ -286,7 +286,7 @@ class Reminders(commands.Cog, name="reminders"):
             ),
             color=0x2EA44F,
         )
-        embed.set_footer(text="Warnings at T-30 and T-10 | Rebase at 12:00 PM and 6:00 PM UTC+8")
+        embed.set_footer(text="Warnings at T-30 and T-10 | Rebase at 12:00 AM and 6:00 PM UTC+8")
         await context.send(embed=embed)
 
     @commands.hybrid_command(
